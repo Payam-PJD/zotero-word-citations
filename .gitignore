@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+build/
+dist/
+
+# Local Word documents and Zotero audit output can contain private metadata.
+samples/
+dois.txt
+*_zotero_cited.docx
+
+# IDE and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
