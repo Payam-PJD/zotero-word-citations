@@ -2,12 +2,16 @@ import json
 import unittest
 
 from zotero_word_citations.word import (
+    _PositionMap,
     _existing_field_ranges,
     _field_code,
+    _force_final_view,
     _is_zotero_field,
+    _mapped_groups_in_range,
     _merge_ranges,
     _overlaps_existing_field,
     _overlaps_existing_zotero_field,
+    _restore_view,
     _unfielded_story_ranges,
 )
 from zotero_word_citations.zotero import ZoteroRecord
@@ -94,6 +98,106 @@ class WordPayloadTests(unittest.TestCase):
             [(1, 12), (20, 25)],
             _merge_ranges([(5, 10), (1, 6), (10, 12), (20, 25), (22, 24)]),
         )
+
+    def test_position_map_skips_hidden_word_positions_before_placeholder(self):
+        class Range:
+            def __init__(self, slots, start=0, end=None):
+                self.slots = slots
+                self.Start = start
+                self.End = len(slots) if end is None else end
+
+            @property
+            def Text(self):
+                return "".join(value or "" for value in self.slots[self.Start:self.End])
+
+            @property
+            def Duplicate(self):
+                return Range(self.slots, self.Start, self.End)
+
+            def SetRange(self, start, end):
+                self.Start = start
+                self.End = end
+
+        prefix = list("Before ")
+        hidden = [None] * 9
+        placeholder = list("(10.1000/one 10.2000/two)")
+        source = Range(prefix + hidden + placeholder + list(" after"))
+        mapper = _PositionMap(source, chunk_size=4)
+        self.assertTrue(mapper.consistent)
+
+        warnings = []
+        groups = _mapped_groups_in_range(
+            source,
+            story_start=0,
+            story_type=1,
+            story_index=0,
+            formats=None,
+            warnings=warnings,
+        )
+        self.assertEqual([], warnings)
+        self.assertEqual(1, len(groups))
+        self.assertEqual(len(prefix) + len(hidden), groups[0].start)
+        self.assertEqual(
+            len(prefix) + len(hidden) + len(placeholder), groups[0].end
+        )
+
+    def test_hidden_positions_inside_placeholder_are_skipped(self):
+        class Range:
+            def __init__(self, slots, start=0, end=None):
+                self.slots = slots
+                self.Start = start
+                self.End = len(slots) if end is None else end
+
+            @property
+            def Text(self):
+                return "".join(value or "" for value in self.slots[self.Start:self.End])
+
+            @property
+            def Duplicate(self):
+                return Range(self.slots, self.Start, self.End)
+
+            def SetRange(self, start, end):
+                self.Start = start
+                self.End = end
+
+        source = Range(list("(10.1000/") + [None] + list("one)"))
+        warnings = []
+        groups = _mapped_groups_in_range(
+            source,
+            story_start=0,
+            story_type=1,
+            story_index=0,
+            formats=None,
+            warnings=warnings,
+        )
+        self.assertEqual([], groups)
+        self.assertEqual(1, len(warnings))
+
+    def test_revision_view_is_pinned_and_restored(self):
+        class Filter:
+            Markup = 2
+
+        class View:
+            ShowRevisionsAndComments = True
+            RevisionsView = 1
+            RevisionsFilter = Filter()
+
+        class Window:
+            pass
+
+        class Document:
+            pass
+
+        document = Document()
+        document.ActiveWindow = Window()
+        document.ActiveWindow.View = View()
+        saved = _force_final_view(document)
+        self.assertEqual(0, document.ActiveWindow.View.RevisionsView)
+        self.assertFalse(document.ActiveWindow.View.ShowRevisionsAndComments)
+        _restore_view(saved)
+        self.assertEqual(1, document.ActiveWindow.View.RevisionsView)
+        self.assertTrue(document.ActiveWindow.View.ShowRevisionsAndComments)
+        self.assertEqual(2, document.ActiveWindow.View.RevisionsFilter.Markup)
 
 
 if __name__ == "__main__":

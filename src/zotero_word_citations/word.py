@@ -14,7 +14,7 @@ import tempfile
 from typing import Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
-from .doi import DoiGroup, parse_doi_groups
+from .doi import DoiGroup, find_doi_like_values, parse_doi_groups
 from .zotero import ZoteroRecord
 
 
@@ -23,7 +23,9 @@ WD_DO_NOT_SAVE_CHANGES = 0
 WD_FIELD_ADDIN = 81
 WD_FIELD_QUOTE = 35
 WD_FORMAT_DOCUMENT_DEFAULT = 16
+WD_REVISIONS_VIEW_FINAL = 0
 MSO_PROPERTY_TYPE_STRING = 4
+POSITION_MAP_CHUNK = 256
 CSL_CITATION_SCHEMA = (
     "https://github.com/citation-style-language/schema/raw/master/csl-citation.json"
 )
@@ -57,6 +59,128 @@ class InsertedCitation:
     item_keys: tuple[str, ...]
     citation_id: str
     provisional_text: str
+
+
+class _PositionMap:
+    """Map displayed-text indices in a Word range to Word positions.
+
+    Word positions include hidden tracked deletions and field instructions,
+    while ``Range.Text`` follows the current revision view. A Python string
+    index therefore cannot safely be added to ``Range.Start``. This map uses
+    bounded COM probes and refuses inconsistent/non-additive ranges.
+    """
+
+    def __init__(self, com_range, chunk_size: int = POSITION_MAP_CHUNK) -> None:
+        self._source = com_range.Duplicate
+        self._start = int(com_range.Start)
+        self._end = int(com_range.End)
+        self.text = str(com_range.Text or "")
+        self._marks = [self._start]
+        self._cumulative = [0]
+
+        total = 0
+        position = self._start
+        probe = com_range.Duplicate
+        while position < self._end:
+            next_position = min(position + max(1, chunk_size), self._end)
+            probe.SetRange(position, next_position)
+            total += len(str(probe.Text or ""))
+            self._marks.append(next_position)
+            self._cumulative.append(total)
+            position = next_position
+        self.consistent = total == len(self.text)
+
+    def _displayed_before(self, position: int) -> int:
+        low, high = 0, len(self._marks) - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._marks[middle] <= position:
+                low = middle
+            else:
+                high = middle - 1
+        total = self._cumulative[low]
+        if self._marks[low] == position:
+            return total
+        probe = self._source.Duplicate
+        probe.SetRange(self._marks[low], position)
+        return total + len(str(probe.Text or ""))
+
+    def start_position(self, index: int) -> int:
+        """Return the Word position of displayed character ``index``."""
+
+        if not 0 <= index <= len(self.text):
+            raise IndexError(index)
+        low, high = self._start, self._end
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._displayed_before(middle) <= index:
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def end_position(self, index: int) -> int:
+        """Return the first Word position after ``index`` displayed chars."""
+
+        if not 0 <= index <= len(self.text):
+            raise IndexError(index)
+        low, high = self._start, self._end
+        while low < high:
+            middle = (low + high) // 2
+            if self._displayed_before(middle) >= index:
+                high = middle
+            else:
+                low = middle + 1
+        return low
+
+
+def _force_final_view(document) -> dict[str, object]:
+    """Show final text deterministically and return state for restoration."""
+
+    try:
+        view = document.ActiveWindow.View
+    except Exception as exc:
+        raise WordError("Microsoft Word did not expose a document view.") from exc
+
+    saved: dict[str, object] = {"view": view}
+    for name in ("ShowRevisionsAndComments", "RevisionsView"):
+        try:
+            saved[name] = getattr(view, name)
+        except Exception:
+            pass
+    try:
+        saved["Markup"] = view.RevisionsFilter.Markup
+    except Exception:
+        pass
+
+    try:
+        view.RevisionsView = WD_REVISIONS_VIEW_FINAL
+        view.ShowRevisionsAndComments = False
+    except Exception as exc:
+        raise WordError(
+            "Microsoft Word could not be pinned to Final revision view; "
+            "conversion was stopped to avoid citing deleted text."
+        ) from exc
+    return saved
+
+
+def _restore_view(saved: dict[str, object] | None) -> None:
+    if not saved:
+        return
+    view = saved.get("view")
+    if view is None:
+        return
+    if "Markup" in saved:
+        try:
+            view.RevisionsFilter.Markup = saved["Markup"]
+        except Exception:
+            pass
+    for name in ("RevisionsView", "ShowRevisionsAndComments"):
+        if name in saved:
+            try:
+                setattr(view, name, saved[name])
+            except Exception:
+                pass
 
 
 def _iter_story_ranges(document) -> Iterator[tuple[int, int, object]]:
@@ -202,8 +326,56 @@ def _overlaps_existing_zotero_field(story, start: int, end: int) -> bool:
     )
 
 
+def _mapped_groups_in_range(
+    safe_range,
+    *,
+    story_start: int,
+    story_type: int,
+    story_index: int,
+    formats: Iterable[str] | None,
+    warnings: list[str],
+) -> list[DoiGroup]:
+    mapper = _PositionMap(safe_range)
+    if not mapper.text:
+        return []
+    if not mapper.consistent:
+        raise WordError(
+            "Word reported inconsistent displayed-text lengths in story "
+            f"{story_type}/{story_index}; refusing to guess DOI offsets."
+        )
+
+    mapped: list[DoiGroup] = []
+    verifier = safe_range.Duplicate
+    for group in parse_doi_groups(
+        mapper.text,
+        formats=formats,
+        story_type=story_type,
+        story_index=story_index,
+    ):
+        begin = mapper.start_position(group.start)
+        finish = mapper.end_position(group.end)
+        verifier.SetRange(begin, finish)
+        actual = str(verifier.Text or "")
+        if actual != group.source or finish - begin != len(group.source):
+            warnings.append(
+                "Skipped a DOI placeholder containing hidden/interleaved Word "
+                f"content in story {story_type}/{story_index}: {group.source}"
+            )
+            continue
+        mapped.append(
+            replace(
+                group,
+                start=begin - story_start,
+                end=finish - story_start,
+            )
+        )
+    return mapped
+
+
 def scan_word_document(
-    input_path: Path, formats: Iterable[str] | None = None
+    input_path: Path,
+    formats: Iterable[str] | None = None,
+    warnings: list[str] | None = None,
 ) -> list[DoiGroup]:
     """Read all normal Word stories and locate DOI placeholders safely.
 
@@ -229,6 +401,8 @@ def scan_word_document(
     word.DisplayAlerts = 0
     document = None
     groups: list[DoiGroup] = []
+    scan_warnings = warnings if warnings is not None else []
+    view_state: dict[str, object] | None = None
     try:
         document = word.Documents.Open(
             str(source),
@@ -236,22 +410,18 @@ def scan_word_document(
             ReadOnly=True,
             AddToRecentFiles=False,
         )
+        view_state = _force_final_view(document)
         for story_type, story_index, story in _iter_story_ranges(document):
             story_start = int(story.Start)
             for safe_range in _unfielded_story_ranges(story):
-                safe_text = str(safe_range.Text)
-                coordinate_offset = int(safe_range.Start) - story_start
                 groups.extend(
-                    replace(
-                        group,
-                        start=group.start + coordinate_offset,
-                        end=group.end + coordinate_offset,
-                    )
-                    for group in parse_doi_groups(
-                        safe_text,
-                        formats=formats,
+                    _mapped_groups_in_range(
+                        safe_range,
+                        story_start=story_start,
                         story_type=story_type,
                         story_index=story_index,
+                        formats=formats,
+                        warnings=scan_warnings,
                     )
                 )
 
@@ -300,6 +470,7 @@ def scan_word_document(
     finally:
         if document is not None:
             try:
+                _restore_view(view_state)
                 document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
             except Exception:
                 pass
@@ -313,6 +484,52 @@ def scan_word_document(
         groups,
         key=lambda group: (group.story_type, group.story_index, group.start, group.end),
     )
+
+
+def scan_word_doi_like_values(input_path: Path) -> tuple[str, ...]:
+    """Return DOI-shaped visible text outside all Word fields in Final view."""
+
+    try:
+        import win32com.client  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise WordError("pywin32 is required to read Microsoft Word files.") from exc
+
+    source = input_path.expanduser().resolve()
+    word = win32com.client.DispatchEx("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = 0
+    document = None
+    view_state: dict[str, object] | None = None
+    values: list[str] = []
+    try:
+        document = word.Documents.Open(
+            str(source),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+        )
+        view_state = _force_final_view(document)
+        for _, _, story in _iter_story_ranges(document):
+            for safe_range in _unfielded_story_ranges(story):
+                values.extend(find_doi_like_values(str(safe_range.Text or "")))
+    except Exception as exc:
+        if isinstance(exc, WordError):
+            raise
+        raise WordError(f"Microsoft Word reconciliation scan failed: {exc}") from exc
+    finally:
+        if document is not None:
+            try:
+                _restore_view(view_state)
+                document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
+            except Exception:
+                pass
+        try:
+            word.Quit()
+        finally:
+            document = None
+            word = None
+            gc.collect()
+    return tuple(values)
 
 
 def _random_id(length: int = 8) -> str:
@@ -520,11 +737,22 @@ def convert_word_document(
     document = None
     inserted: list[InsertedCitation] = []
     created_preferences = False
+    view_state: dict[str, object] | None = None
+    original_track_revisions: bool | None = None
     try:
         document = word.Documents.Open(
             str(source), ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
         )
+        view_state = _force_final_view(document)
+        try:
+            original_track_revisions = bool(document.TrackRevisions)
+        except Exception:
+            original_track_revisions = None
         document.SaveAs2(str(temporary), FileFormat=WD_FORMAT_DOCUMENT_DEFAULT)
+        # Never record the placeholder replacement itself as tracked changes.
+        # Existing revisions are preserved. Word may split an existing tracked
+        # insertion around a new field, but its revision content is unchanged.
+        document.TrackRevisions = False
         created_preferences = _ensure_document_data(document, zotero_version, style_id)
 
         inserted_by_ordinal: list[tuple[int, InsertedCitation]] = []
@@ -598,22 +826,33 @@ def convert_word_document(
         field = None
         target = None
 
+        if original_track_revisions is not None:
+            document.TrackRevisions = original_track_revisions
+        _restore_view(view_state)
+        view_state = None
         document.Save()
         document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
         document = None
+        original_track_revisions = None
 
         # A field changes from the temporary QUOTE type (35) to Word's ADDIN
         # type (81) only after save/reopen. Validate before committing output.
         document = word.Documents.Open(
             str(temporary), ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
         )
+        view_state = _force_final_view(document)
         _validate_persisted_fields(document, inserted)
+        _restore_view(view_state)
+        view_state = None
         document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
         document = None
         os.replace(temporary, destination)
     except Exception as exc:
         if document is not None:
             try:
+                if original_track_revisions is not None:
+                    document.TrackRevisions = original_track_revisions
+                _restore_view(view_state)
                 document.Close(SaveChanges=WD_DO_NOT_SAVE_CHANGES)
             except Exception:
                 pass

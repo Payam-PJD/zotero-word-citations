@@ -5,6 +5,7 @@ import json
 
 from zotero_word_citations.zotero import (
     ZoteroClient,
+    ZoteroError,
     add_doi_to_local_zotero,
     add_doi_with_cli,
 )
@@ -20,6 +21,19 @@ class InMemoryClient(ZoteroClient):
 
 
 class ZoteroSelectionTests(unittest.TestCase):
+    @patch("zotero_word_citations.zotero.time.sleep")
+    @patch("zotero_word_citations.zotero.time.monotonic", side_effect=[0.0, 0.0])
+    def test_wait_until_available_retries_transient_startup(self, _clock, sleep):
+        client = ZoteroClient()
+        with patch.object(
+            client,
+            "_request_json",
+            side_effect=[ZoteroError("starting"), ([], {})],
+        ) as request:
+            client.wait_until_available(timeout=1.0, interval=0.1)
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once()
+
     def test_duplicate_item_keys_are_sorted_alphabetically(self):
         items = [
             {"key": "ZAKPLF5D", "data": {"DOI": "10.1/example"}},

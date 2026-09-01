@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zotero-word-citations"
-version = "0.3.0"
+version = "0.4.0"
 description = "Discover DOI placeholders in Word, import missing Zotero records, and create active citation fields."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -70,18 +71,54 @@ class ZoteroClient:
         self._opener = build_opener(ProxyHandler({}))
         self.version = "unknown"
 
-    def _request_json(self, path: str, params: dict[str, Any] | None = None) -> tuple[Any, Any]:
+    def _request_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[Any, Any]:
         query = f"?{urlencode(params)}" if params else ""
         request = Request(f"{self.base_url}{path}{query}")
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
                 self.version = response.headers.get("X-Zotero-Version", self.version)
                 return json.load(response), response.headers
         except (OSError, URLError, json.JSONDecodeError) as exc:
             raise ZoteroError(
-                f"Cannot read Zotero local API at {self.base_url}. "
-                "Make sure Zotero is running."
+                f"Zotero's local HTTP API did not respond at {self.base_url}. "
+                "Zotero may be open, but the package also requires its local "
+                "API/server on port 23119. Check Zotero Settings > Advanced > "
+                "Allow other applications on this computer to communicate "
+                "with Zotero, then restart Zotero."
             ) from exc
+
+    def wait_until_available(
+        self, timeout: float = 12.0, interval: float = 1.0
+    ) -> None:
+        """Wait briefly for Zotero's desktop API instead of failing instantly."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        last_error: ZoteroError | None = None
+        while True:
+            try:
+                self._request_json(
+                    f"/api/users/{self.library_id}/items",
+                    {"format": "json", "limit": 1},
+                    timeout=min(2.0, self.timeout),
+                )
+                return
+            except ZoteroError as exc:
+                last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(max(0.05, interval), remaining))
+        raise last_error or ZoteroError(
+            f"Zotero's local HTTP API did not respond at {self.base_url}."
+        )
 
     def search_exact_doi(self, doi: str) -> list[dict[str, Any]]:
         normalized = normalize_doi(doi)

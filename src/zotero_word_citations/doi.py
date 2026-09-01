@@ -20,16 +20,23 @@ DOI_FORMATS = (
 # catches old DOI suffixes containing parentheses while still handling adjacent
 # placeholders such as ``10.1/a;10.2/b``.
 _DOI_START_RE = re.compile(
-    r"(?<![A-Za-z0-9])"
     r"(?:(?P<url>https?://(?:dx\.)?doi\.org/)|(?P<label>doi\s*:\s*))?"
     r"(?P<doi>10\.\d{4,9}/)",
     re.IGNORECASE,
 )
 _SUFFIX_RE = re.compile(r"[-._;()/:A-Z0-9<>%+@]+", re.IGNORECASE)
+_DOI_LIKE_RE = re.compile(
+    r"10\.\d{4,9}/[-._;()/:A-Z0-9<>%+@]+", re.IGNORECASE
+)
 _BIBTEX_PREFIX_RE = re.compile(
     r"(?i)(?:\\?(?:cite|citep|citet|autocite|parencite|textcite|footcite)\*?\s*)$"
 )
-_SEPARATOR_RE = re.compile(r"(?:\s*[,;]\s*|\s*-\s*)+")
+_INLINE_SPACE = r"[ \t\u00a0]"
+_SEPARATOR_RE = re.compile(
+    rf"(?:{_INLINE_SPACE}*[,;]{_INLINE_SPACE}*|"
+    rf"{_INLINE_SPACE}*-{_INLINE_SPACE}*|{_INLINE_SPACE}+)+"
+)
+_WRAPPER_TAIL_RE = re.compile(r"\s*[.,;:!?]?\s*")
 _TRAILING_PUNCTUATION = ".,;:!?"
 _BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
 _FORMAT_FOR_OPEN = {"(": "round", "[": "square", "{": "curly"}
@@ -125,6 +132,21 @@ def find_doi_tokens(text: str) -> list[DoiToken]:
     return tokens
 
 
+def find_doi_like_values(text: str) -> list[str]:
+    """Find raw DOI-shaped text independently of placeholder grouping.
+
+    This intentionally has no left-boundary requirement. It is used after a
+    conversion to warn if DOI-looking text remains outside protected fields.
+    """
+
+    values: list[str] = []
+    for match in _DOI_LIKE_RE.finditer(text):
+        candidate = _trim_suffix(match.group(0).rstrip(" \t\r\n,;-"))
+        if candidate:
+            values.append(normalize_doi(candidate))
+    return values
+
+
 def _bracket_pairs(text: str) -> list[tuple[int, int, str]]:
     stack: list[tuple[str, int]] = []
     pairs: list[tuple[int, int, str]] = []
@@ -163,7 +185,7 @@ def _only_dois_and_separators(
         elif gap and not _SEPARATOR_RE.fullmatch(gap):
             return False
         cursor = token.end
-    return not text[cursor:content_end].strip()
+    return _WRAPPER_TAIL_RE.fullmatch(text[cursor:content_end]) is not None
 
 
 def _overlaps(span: tuple[int, int], spans: Iterable[tuple[int, int]]) -> bool:

@@ -2,7 +2,7 @@
 
 Windows package and CLI that discovers DOI placeholders throughout a `.docx`,
 writes a `dois.txt` audit beside the input, resolves each DOI against Zotero,
-adds missing records through the installed Zotero CLI, and replaces resolvable
+adds missing records through the running Zotero desktop app, and replaces resolvable
 placeholders with genuine Word `ADDIN ZOTERO_ITEM CSL_CITATION` fields.
 
 The source document is never overwritten. Existing active Zotero citations and
@@ -17,8 +17,8 @@ their displayed results are scanned or edited.
 
 - Windows with desktop Microsoft Word installed
 - Zotero running with its local HTTP API enabled (default port `23119`)
-- `zotero-cli` installed if cloud-backed imports are desired; local-only CLI
-  installations automatically fall back to Zotero's desktop Connector API
+- Optional: a cloud-configured `zotero-cli` if you explicitly want it as a
+  secondary import route
 - Python 3.10+
 
 ## Installation
@@ -92,10 +92,12 @@ https://doi.org/10.1000/example
 \citep{10.1000/one,10.1000/two}
 ```
 
-Comma-, semicolon-, and hyphen-separated DOI sequences become one merged
+DOIs may touch adjacent prose without a space. Comma-, semicolon-, hyphen-, and
+inline-space-separated DOI sequences become one merged
 Zotero citation field. Parentheses, brackets, braces, a DOI URL/prefix, and a
 recognized LaTeX citation command are removed as part of the placeholder.
-Sentence punctuation outside the placeholder is retained.
+Sentence punctuation outside the placeholder is retained. A placeholder group
+never extends across a paragraph or manual line break.
 
 To restrict processing, repeat `--format` with one or more of:
 
@@ -118,12 +120,12 @@ metadata service recognizes them.
 - Existing DOI matches are case-insensitive and otherwise exact.
 - Duplicate Zotero records are sorted alphabetically by their eight-character
   Zotero item key; the first key is cited.
-- A missing DOI is first passed to `zotero-cli add doi` in idempotent `skip`
-  mode.
-- If the CLI is unavailable for writes (including local-only mode), metadata is
-  fetched from Crossref and saved directly through the running Zotero desktop
-  Connector API. This fallback creates no attachment and requires no cloud API
+- A missing DOI is fetched from Crossref and saved through the running Zotero
+  desktop Connector API. This creates no attachment and requires no cloud API
   key.
+- A cloud-configured CLI can be requested as a secondary fallback with
+  `--zotero-cli zotero-cli`. The commonly installed local-mode CLI is read-only
+  for this purpose and is therefore not used by default.
 - After either import path, the package waits for the record to become visible
   in the desktop library before creating its field. Adjust this with
   `--sync-timeout SECONDS`.
@@ -132,8 +134,8 @@ metadata service recognizes them.
   is left unchanged so no source information is lost. Other complete
   placeholders are still converted.
 
-The CLI path uses `linked_url` attachment mode, avoiding automatic PDF
-downloads. The local Connector fallback adds metadata only.
+The optional CLI path uses `linked_url` attachment mode, avoiding automatic PDF
+downloads. The local Connector path adds metadata only.
 
 ## `dois.txt` audit
 
@@ -147,6 +149,9 @@ selected Zotero item key/title, duplicate candidates, and one of these outcomes:
 - `FAILED`
 
 Every placeholder is separately marked `CITED` or `SKIPPED`.
+Warnings are recorded as well. After conversion, a `LEFT IN PROSE` section
+lists any DOI-like text that unexpectedly remains outside protected Zotero
+fields, after deliberately skipped placeholders are accounted for.
 
 ## Use from Jupyter/IPython
 
@@ -202,6 +207,12 @@ Open and save a `.docx`, make it the active document, and select the new Quick
 Access button. Keep Zotero running. The macro waits for conversion, opens the
 new file when successful, and tells you to use **Zotero > Refresh**.
 
+If the macro says that it cannot connect while Zotero is visibly open, open
+**Zotero Settings > Advanced**, enable **Allow other applications on this
+computer to communicate with Zotero**, restart Zotero, and try again. The
+package retries the local connection briefly to accommodate a newly started
+Zotero session.
+
 The macro starts Python with the Windows launcher command `py`. If Word reports that Python
 cannot be found, open the imported module in the Visual Basic Editor and change
 this line to the full path of the Python installation where the package was
@@ -233,6 +244,13 @@ require an administrator-approved trusted location or a locally signed macro.
 - Literal DOI placeholders before or after existing fields use Word's real
   character coordinates, so hidden Zotero JSON cannot shift a replacement onto
   the wrong text.
+- Scanning and conversion are pinned to Word's Final revision view, so text in
+  tracked deletions is not cited. Existing revisions and comments are retained.
+- Citation replacements are inserted with revision tracking temporarily off,
+  then the document's original `TrackRevisions` setting is restored. This keeps
+  replacements from becoming pending tracked deletions/insertions.
+- A mapped replacement is skipped with a warning if hidden/interleaved Word
+  positions make its exact visible span unsafe to identify.
 - A second overlap check runs immediately before insertion and aborts the
   conversion if a requested replacement touches any existing Zotero field.
 

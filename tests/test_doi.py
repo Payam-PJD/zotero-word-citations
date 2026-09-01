@@ -1,6 +1,7 @@
 import unittest
 
 from zotero_word_citations.doi import (
+    find_doi_like_values,
     find_doi_tokens,
     parse_doi_groups,
     parse_parenthesized_dois,
@@ -94,6 +95,45 @@ class ParseDoiTests(unittest.TestCase):
         )
         self.assertEqual("bibtex", groups[0].format)
         self.assertEqual(("10.20944/preprints202311.0688.v1",), groups[0].dois)
+
+    def test_doi_glued_to_letters_or_digits_is_not_silently_dropped(self):
+        text = (
+            "dementia10.1007/s11914-023-00847-x, "
+            "10.1080/03008207.2020.1682282, "
+            "10.1007/s11914-023-00848-w and "
+            "Exam710.1161/JAHA.122.026460"
+        )
+        groups = parse_doi_groups(text)
+        self.assertEqual(2, len(groups))
+        self.assertEqual(
+            (
+                "10.1007/s11914-023-00847-x",
+                "10.1080/03008207.2020.1682282",
+                "10.1007/s11914-023-00848-w",
+            ),
+            groups[0].dois,
+        )
+        self.assertEqual(("10.1161/jaha.122.026460",), groups[1].dois)
+
+    def test_space_separated_dois_merge_and_wrapper_is_removed(self):
+        text = "Before (10.1000/one 10.2000/two, - 10.3000/three.) after"
+        groups = parse_doi_groups(text)
+        self.assertEqual(1, len(groups))
+        self.assertEqual("(10.1000/one 10.2000/two, - 10.3000/three.)", groups[0].source)
+        self.assertEqual(
+            ("10.1000/one", "10.2000/two", "10.3000/three"),
+            groups[0].dois,
+        )
+
+    def test_space_separator_does_not_merge_across_word_paragraphs(self):
+        groups = parse_doi_groups("10.1000/one\r10.2000/two\n10.3000/three")
+        self.assertEqual(3, len(groups))
+
+    def test_reconciliation_finder_has_no_left_boundary_requirement(self):
+        self.assertEqual(
+            ["10.1234/abc", "10.5678/def"],
+            find_doi_like_values("word10.1234/abc and 710.5678/def."),
+        )
 
 
 if __name__ == "__main__":
