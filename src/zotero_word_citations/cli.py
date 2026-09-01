@@ -61,8 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--zotero-cli",
-        default="zotero-cli",
-        help="Zotero CLI executable used to add missing DOI records.",
+        default=None,
+        help=(
+            "Optional Zotero CLI executable for a secondary cloud-write "
+            "fallback. Omit for normal local desktop use."
+        ),
     )
     parser.add_argument(
         "--import-timeout",

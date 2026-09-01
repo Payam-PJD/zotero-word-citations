@@ -36,11 +36,16 @@ class DoiReportTests(unittest.TestCase):
                 placeholder_outcomes=[
                     PlaceholderOutcome(group, "cited", "Active field inserted.")
                 ],
+                warnings=["Review a hidden/interleaved placeholder."],
+                left_in_prose=["10.2000/leftover"],
             )
             report = path.read_text(encoding="utf-8")
         self.assertIn("[METADATA-FETCHED-AND-ADDED] 10.1000/example", report)
         self.assertIn("Selected Zotero key: ABC12345", report)
         self.assertIn("[CITED] main text #1", report)
+        self.assertIn("Review a hidden/interleaved placeholder.", report)
+        self.assertIn("LEFT IN PROSE", report)
+        self.assertIn("10.2000/leftover", report)
 
 
 if __name__ == "__main__":

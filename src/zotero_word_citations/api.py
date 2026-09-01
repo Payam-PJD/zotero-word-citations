@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
@@ -15,6 +17,7 @@ from .word import (
     WORD_STORY_NAMES,
     WordError,
     convert_word_document,
+    scan_word_doi_like_values,
     scan_word_document,
 )
 from .zotero import (
@@ -59,6 +62,8 @@ class ConversionResult:
     doi_outcomes: tuple[DoiOutcome, ...]
     placeholder_outcomes: tuple[PlaceholderOutcome, ...]
     created_preferences: bool
+    warnings: tuple[str, ...] = ()
+    left_in_prose: tuple[str, ...] = ()
 
     @property
     def discovered_dois(self) -> tuple[str, ...]:
@@ -83,8 +88,22 @@ def _progress_handler(
     if progress is not None:
         return progress
     if verbose:
-        return print
+        return _safe_console_print
     return lambda _message: None
+
+
+def _safe_console_print(message: str) -> None:
+    """Print progress without letting a legacy Windows code page abort work."""
+
+    value = str(message)
+    try:
+        print(value)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe = value.encode(encoding, errors="replace").decode(
+            encoding, errors="replace"
+        )
+        print(safe)
 
 
 def _single_line(value: str) -> str:
@@ -100,6 +119,8 @@ def write_doi_report(
     outcomes: Mapping[str, DoiOutcome],
     placeholder_outcomes: Sequence[PlaceholderOutcome] = (),
     formats: Iterable[str] | None = None,
+    warnings: Sequence[str] = (),
+    left_in_prose: Sequence[str] = (),
 ) -> None:
     """Atomically write the human-readable DOI audit report."""
 
@@ -160,6 +181,24 @@ def write_doi_report(
         lines.append(f"   DOIs: {', '.join(group.dois)}")
         lines.append(f"   Note: {_single_line(action.message)}")
 
+    lines.extend(["", "Warnings", "--------"])
+    if not warnings:
+        lines.append("(none)")
+    else:
+        for number, warning in enumerate(warnings, start=1):
+            lines.append(f"{number}. {_single_line(warning)}")
+
+    lines.extend(["", "LEFT IN PROSE", "-------------"])
+    if not left_in_prose:
+        lines.append("(none)")
+    else:
+        lines.append(
+            "These DOI-like values remain outside protected Word fields and "
+            "were not deliberately skipped for unresolved metadata:"
+        )
+        for doi in left_in_prose:
+            lines.append(f"- {doi}")
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -195,7 +234,7 @@ def cite_document(
     library_id: str = "0",
     zotero_data_dir: str | Path | None = None,
     style_id: str = DEFAULT_STYLE_ID,
-    zotero_cli: str = "zotero-cli",
+    zotero_cli: str | None = None,
     import_timeout: float = 180.0,
     sync_timeout: float = 60.0,
     verbose: bool = True,
@@ -233,8 +272,13 @@ def cite_document(
     if report.resolve() in {source, destination.resolve()}:
         raise WordError("The DOI report path must differ from the input and output paths.")
 
+    run_warnings: list[str] = []
     emit(f"[1/4] Scanning Word document: {source.name}")
-    groups = scan_word_document(source, formats=selected_formats or None)
+    groups = scan_word_document(
+        source,
+        formats=selected_formats or None,
+        warnings=run_warnings,
+    )
     unique_dois = list(dict.fromkeys(doi for group in groups for doi in group.dois))
     emit(
         f"      Found {len(groups)} placeholder(s) containing "
@@ -251,6 +295,7 @@ def cite_document(
         groups=groups,
         outcomes=outcomes,
         formats=selected_formats,
+        warnings=run_warnings,
     )
     emit(f"      Discovery report initialized: {report}")
 
@@ -265,10 +310,14 @@ def cite_document(
             doi_outcomes=(),
             placeholder_outcomes=(),
             created_preferences=False,
+            warnings=tuple(run_warnings),
         )
 
     emit("[2/4] Resolving DOI metadata in Zotero.")
     client = ZoteroClient(zotero_url, library_id)
+    emit("      Waiting for Zotero's local API (up to 12 seconds).")
+    client.wait_until_available(timeout=12.0)
+    emit(f"      Connected to Zotero {client.version}.")
     records: dict[str, ZoteroRecord] = {}
     for index, doi in enumerate(unique_dois, start=1):
         emit(f"      ({index}/{len(unique_dois)}) {doi}")
@@ -300,30 +349,56 @@ def cite_document(
             emit("        [SKIP] Missing and --no-add-missing was selected.")
             continue
 
-        emit("        [ADD] Not in the local library; asking zotero-cli to fetch it.")
-        imported = add_doi_with_cli(
-            doi, executable=zotero_cli, timeout=import_timeout
+        emit(
+            "        [ADD] Not in the local library; fetching metadata for "
+            "the running Zotero desktop app."
         )
-        if imported.status == "failed":
-            cli_message = imported.message
+        local_import = add_doi_to_local_zotero(
+            doi,
+            base_url=zotero_url,
+            timeout=min(import_timeout, 60.0),
+        )
+        imported = local_import
+        if (
+            local_import.status not in {"added", "already-present"}
+            and zotero_cli
+        ):
             emit(
-                "        [FALLBACK] zotero-cli could not write; using the local "
-                "Zotero Connector API."
+                "        [FALLBACK] Local metadata import did not succeed; "
+                "trying the optional zotero-cli cloud writer."
             )
-            imported = add_doi_to_local_zotero(
-                doi,
-                base_url=zotero_url,
-                timeout=min(import_timeout, 60.0),
+            cli_import = add_doi_with_cli(
+                doi, executable=zotero_cli, timeout=import_timeout
             )
-            if imported.status == "added":
-                imported = type(imported)(
-                    doi=imported.doi,
-                    status=imported.status,
+            if cli_import.status in {"added", "already-present"}:
+                imported = type(cli_import)(
+                    doi=cli_import.doi,
+                    status=cli_import.status,
                     message=(
-                        f"zotero-cli was unavailable for writes ({cli_message}) "
-                        f"Fallback succeeded: {imported.message}"
+                        f"Local import did not succeed ({local_import.message}) "
+                        f"zotero-cli succeeded: {cli_import.message}"
                     ),
-                    item_key=imported.item_key,
+                    item_key=cli_import.item_key,
+                )
+            elif local_import.status == "metadata-not-found":
+                imported = type(local_import)(
+                    doi=local_import.doi,
+                    status=local_import.status,
+                    message=(
+                        f"{local_import.message} Optional zotero-cli also did "
+                        f"not add it: {cli_import.message}"
+                    ),
+                    item_key=local_import.item_key,
+                )
+            else:
+                imported = type(local_import)(
+                    doi=local_import.doi,
+                    status="failed",
+                    message=(
+                        f"Local import failed: {local_import.message} "
+                        f"Optional zotero-cli also failed: {cli_import.message}"
+                    ),
+                    item_key=cli_import.item_key or local_import.item_key,
                 )
         if imported.status == "metadata-not-found":
             outcomes[doi] = DoiOutcome(
@@ -364,12 +439,12 @@ def cite_document(
                 status="failed",
                 selected_key=imported.item_key or "",
                 message=(
-                    "Metadata was added by zotero-cli but did not become visible "
+                    "Metadata was added but did not become visible "
                     f"in the local Zotero library within {sync_timeout:g} seconds. "
                     "Run Zotero Sync and try again."
                 ),
             )
-            emit("        [FAILED] Added remotely, but local Zotero did not sync in time.")
+            emit("        [FAILED] Added, but local Zotero did not expose it in time.")
             continue
 
         record, resolution = synced
@@ -390,6 +465,7 @@ def cite_document(
             groups=groups,
             outcomes=outcomes,
             formats=selected_formats,
+            warnings=run_warnings,
         )
 
     data_dir = discover_zotero_data_dir(
@@ -445,6 +521,30 @@ def cite_document(
     else:
         emit("[3/4] No placeholder had complete metadata; Word output was not created.")
 
+    left_in_prose: tuple[str, ...] = ()
+    if created_output is not None:
+        remaining = scan_word_doi_like_values(created_output)
+        deliberately_skipped = Counter(
+            doi
+            for item in placeholder_outcomes
+            if item.status == "skipped"
+            for doi in item.group.dois
+        )
+        unexpected: list[str] = []
+        for doi in remaining:
+            if deliberately_skipped[doi] > 0:
+                deliberately_skipped[doi] -= 1
+            else:
+                unexpected.append(doi)
+        left_in_prose = tuple(dict.fromkeys(unexpected))
+        if left_in_prose:
+            warning = (
+                f"{len(left_in_prose)} DOI-like value(s) remain outside active "
+                "fields and were not deliberately skipped. Review LEFT IN PROSE."
+            )
+            run_warnings.append(warning)
+            emit(f"      [WARNING] {warning}")
+
     emit("[4/4] Finalizing dois.txt audit report.")
     write_doi_report(
         report,
@@ -454,6 +554,8 @@ def cite_document(
         outcomes=outcomes,
         placeholder_outcomes=placeholder_outcomes,
         formats=selected_formats,
+        warnings=run_warnings,
+        left_in_prose=left_in_prose,
     )
     if created_output is not None:
         emit(f"[DONE] Created: {created_output}")
@@ -469,4 +571,6 @@ def cite_document(
         doi_outcomes=tuple(outcomes[doi] for doi in unique_dois),
         placeholder_outcomes=tuple(placeholder_outcomes),
         created_preferences=created_preferences,
+        warnings=tuple(run_warnings),
+        left_in_prose=left_in_prose,
     )

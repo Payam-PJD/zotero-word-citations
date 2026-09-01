@@ -55,7 +55,10 @@ Public Sub ZoteroCiteDOIsInActiveDocument()
 
     If exitCode <> 0 Then
         MsgBox "The converter returned error code " & CStr(exitCode) & "." & _
-               vbCrLf & "Review the terminal window and confirm that Zotero is running.", _
+               vbCrLf & "Review the terminal message. If Zotero is already open, " & _
+               "enable its local API under Zotero Settings > Advanced > " & _
+               "Allow other applications on this computer to communicate with Zotero, " & _
+               "then restart Zotero.", _
                vbCritical, "Zotero Word Citations"
         Exit Sub
     End If
